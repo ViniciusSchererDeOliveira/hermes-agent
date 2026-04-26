@@ -383,6 +383,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "us.meta.llama4-maverick-17b-instruct-v1:0",
         "us.meta.llama4-scout-17b-instruct-v1:0",
     ],
+    # Azure Foundry: user-provided endpoint and model.
+    # Empty list because models depend on the endpoint configuration.
+    "azure-foundry": [],
 }
 
 # Vercel AI Gateway: derive the bare-model-id catalog from the curated
@@ -740,6 +743,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("opencode-zen",   "OpenCode Zen",             "OpenCode Zen (35+ curated models, pay-as-you-go)"),
     ProviderEntry("opencode-go",    "OpenCode Go",              "OpenCode Go (open models, $10/month subscription)"),
     ProviderEntry("bedrock",        "AWS Bedrock",              "AWS Bedrock (Claude, Nova, Llama, DeepSeek — IAM or API key)"),
+    ProviderEntry("azure-foundry",  "Azure Foundry",            "Azure Foundry (OpenAI-style or Anthropic-style endpoint — your Azure AI deployment)"),
 ]
 
 # Derived dicts — used throughout the codebase
@@ -872,7 +876,16 @@ def fetch_openrouter_models(
     if _openrouter_catalog_cache is not None and not force_refresh:
         return list(_openrouter_catalog_cache)
 
-    fallback = list(OPENROUTER_MODELS)
+    # Prefer the remotely-hosted catalog manifest; fall back to the in-repo
+    # snapshot when the manifest is unreachable. Both are curated lists that
+    # drive the picker; the OpenRouter live /v1/models filter (tool support,
+    # free pricing) is applied on top either way.
+    try:
+        from hermes_cli.model_catalog import get_curated_openrouter_models
+        remote = get_curated_openrouter_models()
+    except Exception:
+        remote = None
+    fallback = list(remote) if remote else list(OPENROUTER_MODELS)
     preferred_ids = [mid for mid, _ in fallback]
 
     try:
@@ -923,6 +936,24 @@ def fetch_openrouter_models(
 def model_ids(*, force_refresh: bool = False) -> list[str]:
     """Return just the OpenRouter model-id strings."""
     return [mid for mid, _ in fetch_openrouter_models(force_refresh=force_refresh)]
+
+
+def get_curated_nous_model_ids() -> list[str]:
+    """Return the curated Nous Portal model-id list.
+
+    Prefers the remotely-hosted catalog manifest (published under
+    ``website/static/api/model-catalog.json``); falls back to the in-repo
+    snapshot in ``_PROVIDER_MODELS["nous"]`` when the manifest is
+    unreachable. Always returns a list (never None).
+    """
+    try:
+        from hermes_cli.model_catalog import get_curated_nous_models
+        remote = get_curated_nous_models()
+    except Exception:
+        remote = None
+    if remote:
+        return list(remote)
+    return list(_PROVIDER_MODELS.get("nous", []))
 
 
 def _ai_gateway_model_is_free(pricing: Any) -> bool:
@@ -2622,8 +2653,8 @@ def validate_requested_model(
                 )
 
             return {
-                "accepted": False,
-                "persist": False,
+                "accepted": True,
+                "persist": True,
                 "recognized": False,
                 "message": message,
             }
