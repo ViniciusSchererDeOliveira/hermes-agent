@@ -1514,6 +1514,14 @@ class AIAgent:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
         
+        # Dataset logging setup for fine-tuning and auditing
+        import os
+        from hermes_agent.observability.dataset_logger import DatasetLogger
+        if os.getenv("HERMES_LOG_TO_JSONL", "false").lower() == "true":
+            self.dataset_logger = DatasetLogger(self.session_id)
+        else:
+            self.dataset_logger = None
+        
         # Track conversation messages for session logging
         self._session_messages: List[Dict[str, Any]] = []
         self._memory_write_origin = "assistant_tool"
@@ -3348,6 +3356,63 @@ class AIAgent:
         
         # Return everything up to (not including) the last assistant message
         return messages[:last_assistant_idx]
+
+    def _get_recent_exchange_messages(self, messages: List[Dict]) -> List[Dict]:
+        """
+        Extract the most recent complete exchange from the message history.
+        
+        An exchange consists of:
+        1. User message (role: "user")
+        2. Assistant message (role: "assistant") - may include tool_calls
+        3. Tool result messages (role: "tool") - if assistant made tool calls
+        
+        This prevents logging the full history repeatedly and ensures each
+        exchange is logged only once.
+        
+        Args:
+            messages: Full message list from the conversation
+            
+        Returns:
+            List containing the most recent exchange, or empty list if insufficient messages
+        """
+        if len(messages) < 2:
+            return []
+            
+        # Start from the end and work backwards to find a complete exchange
+        # We look for the pattern: [user, assistant, tool*, ...] going backwards
+        
+        # Find the last assistant message
+        last_assistant_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "assistant":
+                last_assistant_idx = i
+                break
+                
+        if last_assistant_idx is None or last_assistant_idx == 0:
+            # No assistant message or it's the first message (invalid exchange)
+            return []
+            
+        # Check if the message before the assistant is a user message
+        if messages[last_assistant_idx - 1].get("role") != "user":
+            # Not a valid user->assistant exchange
+            return []
+            
+        # Now collect the exchange: user message + assistant message + any following tool messages
+        exchange = []
+        
+        # Add the user message
+        exchange.append(messages[last_assistant_idx - 1])
+        
+        # Add the assistant message
+        exchange.append(messages[last_assistant_idx])
+        
+        # Add any tool messages that immediately follow the assistant message
+        i = last_assistant_idx + 1
+        while i < len(messages) and messages[i].get("role") == "tool":
+            exchange.append(messages[i])
+            i += 1
+            
+        return exchange
     
     def _format_tools_for_system_message(self) -> str:
         """
@@ -12376,6 +12441,32 @@ class AIAgent:
 
         # Clear stream callback so it doesn't leak into future calls
         self._stream_callback = None
+
+        # Dataset logging for fine-tuning and auditing
+        if hasattr(self, 'dataset_logger') and self.dataset_logger is not None:
+            try:
+                # Get only the recent exchange (not full history) to avoid duplication
+                exchange_messages = self._get_recent_exchange_messages(messages)
+                
+                # Prepare metadata with token usage and timing info
+                exchange_metadata = {
+                    "prompt_tokens": self.session_prompt_tokens,
+                    "completion_tokens": self.session_completion_tokens,
+                    "total_tokens": self.session_total_tokens,
+                    "estimated_cost_usd": self.session_estimated_cost_usd,
+                    "cost_status": self.session_cost_status,
+                    "finish_reason": messages[-1].get("finish_reason") if messages else None,
+                }
+                
+                self.dataset_logger.log_exchange(
+                    session_id=self.session_id,
+                    model_used=self.model,
+                    system_prompt=self._cached_system_prompt or "",
+                    messages=exchange_messages,
+                    metadata=exchange_metadata
+                )
+            except Exception as e:
+                logger.warning(f"Failed to log dataset exchange: {e}")
 
         # Check skill trigger NOW — based on how many tool iterations THIS turn used.
         _should_review_skills = False
